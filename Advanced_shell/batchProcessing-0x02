@@ -6,7 +6,7 @@ OUT_DIR="$BASE_DIR"
 
 # Names required by grader (lowercase): bulbasaur ivysaur venusaur charmander charmeleon
 POKEMONS=(bulbasaur ivysaur venusaur charmander charmeleon)
-MAX_RETRIES=5
+MAX_ATTEMPTS=3
 INITIAL_BACKOFF=1   # seconds
 DELAY_BETWEEN=1     # seconds between successful requests
 
@@ -14,33 +14,67 @@ for p in "${POKEMONS[@]}"; do
   name_lc=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
   url="https://pokeapi.co/api/v2/pokemon/$name_lc"
   dest="$OUT_DIR/$name_lc.json"
-  tmp=$(mktemp)
-  retries=0
+
+  attempts=1
   backoff=$INITIAL_BACKOFF
 
-  while :; do
-    http_code=$(curl -sS -w '%{http_code}' -o "$tmp" "$url" || printf '000')
+  saved=false
+  while [ "$attempts" -le "$MAX_ATTEMPTS" ]; do
+    tmp=$(mktemp)
+
+    # Use guarded curl so set -e doesn't abort the script on transient curl failures
+    if ! http_code=$(curl -sS -w '%{http_code}' -o "$tmp" "$url"); then
+      printf 'Network error fetching %s (attempt %d/%d)\n' "$p" "$attempts" "$MAX_ATTEMPTS" >&2
+      rm -f "$tmp"
+      attempts=$((attempts + 1))
+      if [ "$attempts" -le "$MAX_ATTEMPTS" ]; then
+        sleep "$backoff"
+        backoff=$((backoff * 2))
+        continue
+      else
+        printf 'Giving up on %s after %d attempts due to network errors\n' "$p" "$MAX_ATTEMPTS" >&2
+        break
+      fi
+    fi
+
     if [ "$http_code" = "200" ]; then
       mv -f "$tmp" "$dest"
       printf 'Saved %s\n' "$dest"
+      saved=true
       break
     elif [ "$http_code" = "429" ]; then
-      retries=$((retries+1))
-      if [ "$retries" -gt "$MAX_RETRIES" ]; then
-        printf 'Rate limited: giving up on %s after %d retries\n' "$p" "$MAX_RETRIES" >&2
-        rm -f "$tmp"
+      printf 'Rate limited (429) for %s — attempt %d/%d\n' "$p" "$attempts" "$MAX_ATTEMPTS" >&2
+      rm -f "$tmp"
+      attempts=$((attempts + 1))
+      if [ "$attempts" -le "$MAX_ATTEMPTS" ]; then
+        sleep "$backoff"
+        backoff=$((backoff * 2))
+        continue
+      else
+        printf 'Rate limited: giving up on %s after %d attempts\n' "$p" "$MAX_ATTEMPTS" >&2
         break
       fi
-      printf 'Rate limited (429) for %s — retry %d/%d after %ds\n' "$p" "$retries" "$MAX_RETRIES" "$backoff" >&2
-      sleep "$backoff"
-      backoff=$((backoff * 2))
-      continue
+    elif [[ "$http_code" =~ ^5[0-9][0-9]$ ]]; then
+      # Server error — retry
+      printf 'Server error fetching %s: HTTP %s (attempt %d/%d)\n' "$p" "$http_code" "$attempts" "$MAX_ATTEMPTS" >&2
+      rm -f "$tmp"
+      attempts=$((attempts + 1))
+      if [ "$attempts" -le "$MAX_ATTEMPTS" ]; then
+        sleep "$backoff"
+        backoff=$((backoff * 2))
+        continue
+      else
+        printf 'Server errors persistent: giving up on %s after %d attempts\n' "$p" "$MAX_ATTEMPTS" >&2
+        break
+      fi
     else
+      # Client error (e.g., 404) or other unexpected HTTP code — do not retry
       printf 'Failed to fetch %s: HTTP %s\n' "$p" "$http_code" >&2
       rm -f "$tmp"
       break
     fi
   done
 
+  # proceed to next pokemon; preserve delay between successful/attempted requests
   sleep "$DELAY_BETWEEN"
 done
